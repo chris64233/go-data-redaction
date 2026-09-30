@@ -84,6 +84,49 @@ func requireShard(t *Task, shardID string) (*Shard, error) {
 	return nil, fmt.Errorf("%w: shard %s", ErrNotFound, shardID)
 }
 
+// cloneTask returns a deep copy of t so callers can never mutate or race on
+// the coordinator's internal state through an API return value. Every public
+// method that hands a Task (or a Shard inside a Claim) to callers goes through
+// these copies; the on-disk snapshot remains the single source of truth.
+func cloneTask(t *Task) *Task {
+	if t == nil {
+		return nil
+	}
+	cp := *t
+	cp.ShardIDs = append([]string(nil), t.ShardIDs...)
+	cp.Shards = make([]*Shard, len(t.Shards))
+	for i, sh := range t.Shards {
+		if sh == nil {
+			continue
+		}
+		shCopy := *sh
+		if sh.LeaseExpiresAt != nil {
+			exp := *sh.LeaseExpiresAt
+			shCopy.LeaseExpiresAt = &exp
+		}
+		cp.Shards[i] = &shCopy
+	}
+	if t.PublishedAt != nil {
+		pub := *t.PublishedAt
+		cp.PublishedAt = &pub
+	}
+	if t.CancelledAt != nil {
+		cancelled := *t.CancelledAt
+		cp.CancelledAt = &cancelled
+	}
+	return &cp
+}
+
+// shardSnapshot returns a detached copy of one shard for use in a Claim.
+func shardSnapshot(sh *Shard) *Shard {
+	cp := *sh
+	if sh.LeaseExpiresAt != nil {
+		exp := *sh.LeaseExpiresAt
+		cp.LeaseExpiresAt = &exp
+	}
+	return &cp
+}
+
 // CreateTask freezes the source data version, rule version and shard set.
 //
 // The same external ID with the identical frozen inputs returns the original
@@ -137,14 +180,18 @@ func (s *Service) CreateTask(in CreateInput) (*Task, error) {
 		delete(s.st.extIndex, in.ExternalID)
 		return nil, err
 	}
-	return t, nil
+	return cloneTask(t), nil
 }
 
 // GetTask returns a task by internal or external ID.
 func (s *Service) GetTask(id, externalID string) (*Task, error) {
 	s.st.mu.RLock()
 	defer s.st.mu.RUnlock()
-	return s.resolveRef(id, externalID)
+	t, err := s.resolveRef(id, externalID)
+	if err != nil {
+		return nil, err
+	}
+	return cloneTask(t), nil
 }
 
 // ClaimShard leases one claimable shard to worker for the lease TTL. Only
@@ -200,7 +247,7 @@ func (s *Service) ClaimShard(id, externalID, worker string) (*Claim, error) {
 	return &Claim{
 		TaskID:    t.ID,
 		Attempt:   t.Attempt,
-		Shard:     sh,
+		Shard:     shardSnapshot(sh),
 		LeaseID:   sh.Attempt,
 		ExpiresAt: exp,
 	}, nil
@@ -223,6 +270,9 @@ func (s *Service) ClaimShard(id, externalID, worker string) (*Claim, error) {
 func (s *Service) SubmitReceipt(r *Receipt) (*Ack, bool, error) {
 	if r == nil || r.ShardID == "" {
 		return nil, false, fmt.Errorf("%w: receipt and shard id are required", ErrInvalidInput)
+	}
+	if r.Succeeded && r.Count < 0 {
+		return nil, false, fmt.Errorf("%w: processed count must not be negative", ErrInvalidInput)
 	}
 	s.st.mu.Lock()
 	defer s.st.mu.Unlock()
@@ -291,9 +341,6 @@ func (s *Service) SubmitReceipt(r *Receipt) (*Ack, bool, error) {
 	// Success: verify claimed digest against delivered payload.
 	if !validDigest(r.Digest) {
 		return nil, false, fmt.Errorf("%w: digest must be sha256 hex", ErrInvalidInput)
-	}
-	if len(r.Payload) == 0 {
-		return nil, false, fmt.Errorf("%w: successful receipt requires payload", ErrInvalidInput)
 	}
 	if got := hexDigest(r.Payload); got != r.Digest {
 		return nil, false, fmt.Errorf("%w: claimed %s, payload hashes to %s",
@@ -371,7 +418,7 @@ func (s *Service) Cancel(id, externalID string) (*Task, error) {
 		return nil, err
 	}
 	if t.Status != TaskRunning {
-		return t, nil
+		return cloneTask(t), nil
 	}
 	now := s.clock.Now()
 	t.Status = TaskCancelled
@@ -383,9 +430,9 @@ func (s *Service) Cancel(id, externalID string) (*Task, error) {
 	}
 	// Safe cleanup: no manifest referenced any output of this task.
 	if err := s.st.removeAllOutputsLocked(t.ID); err != nil {
-		return t, fmt.Errorf("task cancelled but output cleanup failed: %w", err)
+		return cloneTask(t), fmt.Errorf("task cancelled but output cleanup failed: %w", err)
 	}
-	return t, nil
+	return cloneTask(t), nil
 }
 
 // publishIfCompleteLocked performs the one-shot publication. It MUST be called

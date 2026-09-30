@@ -249,6 +249,136 @@ func TestReceipt_DigestVerification(t *testing.T) {
 	}
 }
 
+func TestReceipt_EmptyShardOutputIsValid(t *testing.T) {
+	svc, _, _ := testService(t, time.Minute)
+	task := newTestTask(t, svc, "ext-1", "a", "b")
+
+	// A shard may legitimately redact to zero bytes (no records in range).
+	// Digest verification still applies: the digest of empty output is the
+	// well-known sha256 of nothing.
+	c1 := claim(t, svc, task.ID, "w1")
+	empty := []byte{}
+	if _, pub, err := svc.SubmitReceipt(successReceipt(c1, "w1", empty, 0)); err != nil || pub {
+		t.Fatalf("empty output receipt: pub=%v err=%v", pub, err)
+	}
+
+	// A nil payload re-ack of the same empty result is an idempotent replay.
+	replay := successReceipt(c1, "w1", empty, 0)
+	replay.Payload = nil
+	if ack, _, err := svc.SubmitReceipt(replay); err != nil || !ack.Replayed {
+		t.Fatalf("nil-payload replay of empty output: ack=%+v err=%v", ack, err)
+	}
+
+	// Negative processed counts are rejected up front.
+	c2 := claim(t, svc, task.ID, "w2")
+	bad := successReceipt(c2, "w2", []byte("B"), -1)
+	if _, _, err := svc.SubmitReceipt(bad); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("negative count should be ErrInvalidInput, got %v", err)
+	}
+
+	// Finish properly; the published manifest keeps the empty entry and the
+	// empty bytes download as empty.
+	if _, pub, err := svc.SubmitReceipt(successReceipt(c2, "w2", []byte("B"), 2)); err != nil || !pub {
+		t.Fatalf("final receipt should publish: pub=%v err=%v", pub, err)
+	}
+	if b, err := svc.DownloadOutput(task.ID, "", "a"); err != nil || len(b) != 0 {
+		t.Fatalf("empty output download = %d bytes, err=%v", len(b), err)
+	}
+	m, err := svc.GetManifest(task.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var emptyCount int64 = -1
+	for _, e := range m.Entries {
+		if e.ShardID == "a" {
+			emptyCount = e.Count
+		}
+	}
+	if emptyCount != 0 {
+		t.Fatalf("empty shard manifest count = %d, want 0", emptyCount)
+	}
+}
+
+// TestAPI_ReturnsDetachedSnapshots ensures caller-held Task/Shard values are
+// copies: mutating them cannot corrupt coordinator state, and concurrent
+// readers of the returned values never race with internal transitions.
+func TestAPI_ReturnsDetachedSnapshots(t *testing.T) {
+	svc, _, _ := testService(t, time.Minute)
+	task := newTestTask(t, svc, "ext-1", "a")
+	task.Status = TaskCancelled // tamper with the returned value...
+
+	got, err := svc.GetTask(task.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != TaskRunning {
+		t.Fatalf("mutating the create result changed internal state: %s", got.Status)
+	}
+	got.Status = TaskPublished
+	got.ManifestID = "fake"
+	got.Shards[0].Status = ShardSucceeded
+	got.Shards[0].Digest = "fake"
+
+	again, err := svc.GetTask(task.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Status != TaskRunning || again.ManifestID != "" ||
+		again.Shards[0].Status != ShardPending || again.Shards[0].Digest != "" {
+		t.Fatalf("mutating GetTask result leaked into internal state: %+v", again)
+	}
+
+	// The Claim hands back a shard snapshot; advancing the claim's state must
+	// not change the lease the coordinator fenced.
+	c := claim(t, svc, task.ID, "w1")
+	c.Shard.Worker = "attacker"
+	c.Shard.Attempt = 999
+	if _, _, err := svc.SubmitReceipt(&Receipt{
+		TaskID: task.ID, ShardID: "a", Attempt: task.Attempt,
+		LeaseID: 1, Worker: "w1", Succeeded: false, FailReason: "x",
+	}); err != nil {
+		t.Fatalf("coordinator lease altered through claim snapshot: %v", err)
+	}
+
+	// Concurrent reads of returned snapshots vs. state transitions under
+	// -race must not report data races.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 100; i++ {
+			t, err := svc.GetTask(task.ID, "")
+			if err == nil {
+				_ = t.Status
+				for _, sh := range t.Shards {
+					_ = sh.ID + sh.Worker
+				}
+			}
+		}
+	}()
+	for i := 0; i < 100; i++ {
+		svc.Progress(task.ID, "")
+	}
+	<-done
+}
+
+func TestCancel_ReturnedTaskIsSnapshot(t *testing.T) {
+	svc, _, _ := testService(t, time.Minute)
+	task := newTestTask(t, svc, "ext-1", "a")
+	cancelled, err := svc.Cancel(task.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled.Status = TaskRunning
+	cancelled.CancelledAt = nil
+	again, err := svc.GetTask(task.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Status != TaskCancelled || again.CancelledAt == nil {
+		t.Fatalf("mutating cancel result leaked into internal state: %+v", again)
+	}
+}
+
 func TestSucceededShard_DifferentDigestIsConflictNotRetry(t *testing.T) {
 	svc, _, _ := testService(t, time.Minute)
 	task := newTestTask(t, svc, "ext-1", "a", "b")
@@ -636,6 +766,67 @@ func TestConcurrent_CancelVsReceipts_OneTerminalState(t *testing.T) {
 	}
 }
 
+// TestConcurrent_CancelVsRetryReceipt_OneTerminalState races a cancel against
+// the receipt that completes a retried shard: exactly one terminal state may
+// survive, and the losing side must observe the matching terminal error.
+func TestConcurrent_CancelVsRetryReceipt_OneTerminalState(t *testing.T) {
+	for iter := 0; iter < 25; iter++ {
+		svc, _, _ := testService(t, 5*time.Minute)
+		task := newTestTask(t, svc, "ext", "a")
+		c1 := claim(t, svc, task.ID, "w1")
+		if _, _, err := svc.SubmitReceipt(&Receipt{
+			TaskID: task.ID, ShardID: "a", Attempt: c1.Attempt, LeaseID: c1.LeaseID,
+			Worker: "w1", Succeeded: false, FailReason: "transient",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.RetryShard(task.ID, "", "a"); err != nil {
+			t.Fatal(err)
+		}
+		c2 := claim(t, svc, task.ID, "w2")
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		var receiptErr error
+		var receiptPublished bool
+		go func() {
+			defer wg.Done()
+			<-start
+			_, receiptPublished, receiptErr = svc.SubmitReceipt(
+				successReceipt(c2, "w2", []byte("A"), 1))
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			svc.Cancel(task.ID, "")
+		}()
+		close(start)
+		wg.Wait()
+
+		got, _ := svc.GetTask(task.ID, "")
+		switch got.Status {
+		case TaskPublished:
+			if receiptErr != nil || !receiptPublished {
+				t.Fatalf("iter %d: published but receipt saw err=%v pub=%v",
+					iter, receiptErr, receiptPublished)
+			}
+			if b, err := svc.DownloadOutput(task.ID, "", "a"); err != nil || string(b) != "A" {
+				t.Fatalf("iter %d: published output wrong: %q %v", iter, b, err)
+			}
+		case TaskCancelled:
+			if receiptErr == nil || !errors.Is(receiptErr, ErrTaskCancelled) {
+				t.Fatalf("iter %d: cancelled but retried receipt accepted: %v", iter, receiptErr)
+			}
+			if _, err := svc.GetManifest(task.ID, ""); !errors.Is(err, ErrNotPublished) {
+				t.Fatalf("iter %d: cancelled task exposes manifest", iter)
+			}
+		default:
+			t.Fatalf("iter %d: non-terminal final state %s", iter, got.Status)
+		}
+	}
+}
+
 // ---- 5. persistence across restart ----
 
 func TestPersistence_AcrossRestart(t *testing.T) {
@@ -758,14 +949,15 @@ func TestReopen_ManifestWrittenBeforeStateFlush_RepublishesIdempotently(t *testi
 	if _, pub, err := svc.SubmitReceipt(successReceipt(c, "w1", []byte("A"), 1)); err != nil || !pub {
 		t.Fatalf("initial publish: pub=%v err=%v", pub, err)
 	}
-	manifestID := task.ManifestID
 
 	// Simulate a crash after the manifest file was written but before the
 	// state snapshot recorded publication: rewrite state.json back to running.
 	svc.st.mu.Lock()
-	task.Status = TaskRunning
-	task.ManifestID = ""
-	task.PublishedAt = nil
+	internal := svc.st.tasks[task.ID]
+	manifestID := internal.ManifestID
+	internal.Status = TaskRunning
+	internal.ManifestID = ""
+	internal.PublishedAt = nil
 	if err := svc.st.saveLocked(); err != nil {
 		t.Fatal(err)
 	}

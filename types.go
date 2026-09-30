@@ -122,7 +122,9 @@ type Receipt struct {
 	Count  int64
 	// Payload is the redacted shard output. It is stored content-addressed
 	// only after the digest is verified. It may be nil when re-acknowledging
-	// an already accepted result (idempotent duplicate receipt).
+	// an already accepted result (idempotent duplicate receipt). An empty
+	// payload is a legitimate zero-record result and is accepted when Digest
+	// equals the SHA-256 of the empty string.
 	Payload []byte
 	// FailReason describes a retryable failure.
 	FailReason string
